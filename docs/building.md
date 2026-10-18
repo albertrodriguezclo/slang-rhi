@@ -41,13 +41,42 @@ default preset, executables are placed in `build/<configuration>/`.
 Activate the Emscripten SDK, then run from the repository root:
 
 ```sh
-cmake --preset emscripten
-cmake --build build --config Debug --target wasm-test
-python -m http.server 8000 --bind 127.0.0.1 --directory build/Debug
+cmake --preset emscripten -B build/browser
+cmake --build build/browser --config Release
+python -m http.server 8000 --bind 127.0.0.1 --directory build/browser/Release
 ```
 
-Open `http://localhost:8000/wasm-test.html` in a WebGPU-capable browser to verify
-the build.
+Open `http://localhost:8000/` in a WebGPU-capable browser to choose an example.
+The gallery links to `example-runner.html?example=<name>`. This combined runner
+includes Surface, Triangle, ShaderToy, Raster, and Particles in one WASM module,
+so switching examples reuses the loaded Slang compiler. Use the dropdown, F4
+(next), or Shift+F4 (previous) to switch without reloading the page. Shader
+pipelines compile on demand when an example is initialized or first drawn.
+
+Individual `example-<name>.html` binaries and the `wasm-test.html` smoke test
+remain available. The path tracer requires acceleration structures and ray
+tracing, which the WebGPU backend does not support.
+
+The browser examples use the same C++ implementations as the native examples,
+with GLFW input, a canvas that follows the browser window size and pixel density,
+and the shared F1 shortcut to hide the usage overlay. Click the canvas to focus
+keyboard input. The page header shows the adapter name and smoothed FPS,
+independently of the overlay. Escape stops the example; reload the page to restart
+it. Shader sources are packaged in each example's `.data` file and compiled at runtime.
+Serve the generated `.html`, `.js`, `.wasm`, and `.data` files together over
+localhost or HTTPS; opening the HTML directly from disk is not supported.
+
+The shared base runs browser examples on the main thread and keeps frames in an
+offscreen texture while asynchronous WebGPU operations may yield. It prepares
+the presentation pipeline before a final blit acquires and presents the canvas
+texture without yielding, since that texture is valid only for the current
+browser task. Input and resize callbacks queue events for processing between
+frames. ShaderToy also loads shaders on this loop.
+
+Between frames, the runner waits for `requestAnimationFrame` instead of adding
+a fixed delay after rendering. Asyncify GPU waits first yield through browser
+message tasks, then back off to timers for longer waits. This avoids the minimum
+delay of nested timers on short waits while allowing GPU callbacks and input to run.
 
 The preset uses an explicit `ASYNCIFY_ONLY` allowlist in
 [CMakePresets.json](../CMakePresets.json). When adding callers of RHI operations
@@ -58,9 +87,12 @@ pages during draw or dispatch recording. Native binding and layout creation do
 not wait for validation, but constant-buffer mapping can still suspend recording.
 Pipeline creation waits on the asynchronous WebGPU entry points, except for
 deferred pipelines resolved by `finish()`, which must not yield.
-The allowlist must also cover application callers of these operations; the example
-keeps its test callers inside `main` so the `*main*` pattern covers them. Verify
+The allowlist must also cover application callers of these operations, including
+the shared example loop, renderers, and shader-loading helpers. Verify
 both Debug and optimized builds, since inlining changes which stack frames remain.
+
+The preset reserves 64 KiB for the Asyncify stack to accommodate the larger
+example render and initialization call stacks.
 
 The preset also passes `-sBINARYEN_EXTRA_PASSES=--optimize-level=0` to work around
 an Asyncify optimizer failure with WebAssembly exceptions in Emscripten 5.0.7
@@ -108,6 +140,39 @@ cd build/Debug
 On Windows, append `.exe` to executable names. Tests and examples need the
 corresponding build options enabled; windowed examples also need a display and
 a backend that supports rendering and presentation.
+
+The build produces individual binaries such as `example-triangle` and a combined
+`example-runner`. The combined runner starts with Surface by default:
+
+```sh
+./example-runner --list-examples
+./example-runner --example raster
+./example-runner --example triangle --device wgpu
+./example-runner --example particles --free-running
+```
+
+Press F4 to select the next example or Shift+F4 for the previous one. A selection
+switches all backend windows together. The runner waits for the old examples to
+shut down, recreates their devices and windows, and resets input and timing before
+starting the new selection. Example settings are reset on each switch.
+Unsupported backends are skipped using the same feature checks as the individual
+binaries; they are tried again on the next selection. If a runtime selection is
+unsupported by every backend, the runner returns to the last working example.
+An unsupported initial selection exits with failure. Escape or closing a window
+exits the whole runner, including during a switch.
+
+The browser switching smoke test requires Python's `playwright` package and
+Chromium (`python -m playwright install chromium`). From the repository root:
+
+```sh
+python tools/test-example-runner.py build/browser/Debug --scale 2
+python tools/test-example-runner.py build/browser/Release
+```
+
+Build `example-runner` and `example-triangle` first. The test checks runtime
+selection, keyboard cycling, wraparound, resizing, shutdown, and standalone
+behavior, and verifies that switching does not fetch another WASM module.
+Use `--browser-executable <path>` to test with an installed Chromium browser.
 
 GPU test names end in the backend name. Use doctest's test-case filter to select
 tests, or select a backend explicitly:

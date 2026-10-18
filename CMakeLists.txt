@@ -1200,32 +1200,69 @@ if(SLANG_RHI_BUILD_TESTS AND NOT SLANG_RHI_BUILD_SHARED AND NOT EMSCRIPTEN)
 endif()
 
 if(SLANG_RHI_BUILD_EXAMPLES)
-    if(NOT EMSCRIPTEN)
-        find_package(Threads REQUIRED)
-        function(add_example name source)
-            add_executable(${name} ${source})
-            target_compile_features(${name} PRIVATE cxx_std_20)
-            get_filename_component(EXAMPLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${source}" PATH)
-            target_compile_definitions(${name}
-                PRIVATE
-                EXAMPLE_DIR="${EXAMPLE_DIR}"
-                SLANG_RHI_DEBUG=$<BOOL:$<CONFIG:Debug>>
-                SLANG_RHI_NVAPI_INCLUDE_DIR="${SLANG_RHI_NVAPI_INCLUDE_DIR}"
-                SLANG_RHI_OPTIX_DEVICE_HEADER_INCLUDE_DIR="${SLANG_RHI_OPTIX_DEVICE_HEADER_INCLUDE_DIR}"
-                $<$<PLATFORM_ID:Windows>:NOMINMAX> # do not define min/max macros
-                $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN> # reduce windows.h footprint
-                $<$<PLATFORM_ID:Windows>:UNICODE> # force character map to unicode
-            )
-            target_link_libraries(${name} PRIVATE slang-rhi slang glfw Threads::Threads slang-rhi-warnings)
-        endfunction()
-
-        add_example(example-path-tracer examples/path-tracer/example-path-tracer.cpp)
-        add_example(example-particles examples/particles/example-particles.cpp)
-        add_example(example-raster examples/raster/example-raster.cpp)
-        add_example(example-shader-toy examples/shader-toy/example-shader-toy.cpp)
-        add_example(example-surface examples/surface/example-surface.cpp)
-        add_example(example-triangle examples/triangle/example-triangle.cpp)
+    if(EMSCRIPTEN)
+        file(GLOB_RECURSE example_shaders CONFIGURE_DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/examples/*.slang"
+            "${CMAKE_CURRENT_SOURCE_DIR}/examples/*/settings.h"
+        )
     else()
+        find_package(Threads REQUIRED)
+    endif()
+
+    function(add_example name)
+        add_executable(${name} ${ARGN})
+        target_compile_features(${name} PRIVATE cxx_std_20)
+        if(EMSCRIPTEN)
+            set(example_root "/examples")
+            target_sources(${name} PRIVATE examples/base/browser.cpp)
+            set_target_properties(${name} PROPERTIES SUFFIX ".html")
+            target_link_options(${name} PRIVATE
+                "-sUSE_GLFW=3"
+                "--use-port=emdawnwebgpu"
+                "SHELL:--shell-file \"${CMAKE_CURRENT_SOURCE_DIR}/examples/wasm/example.html\""
+            )
+            foreach(shader IN LISTS example_shaders)
+                file(RELATIVE_PATH shader_path "${CMAKE_CURRENT_SOURCE_DIR}" "${shader}")
+                target_link_options(${name} PRIVATE "SHELL:--preload-file \"${shader}@/${shader_path}\"")
+            endforeach()
+            set_property(TARGET ${name} APPEND PROPERTY LINK_DEPENDS
+                ${example_shaders} "${CMAKE_CURRENT_SOURCE_DIR}/examples/wasm/example.html"
+            )
+        else()
+            set(example_root "${CMAKE_CURRENT_SOURCE_DIR}/examples")
+            target_link_libraries(${name} PRIVATE glfw Threads::Threads)
+        endif()
+        target_compile_definitions(${name} PRIVATE
+            EXAMPLE_ROOT="${example_root}"
+            SLANG_RHI_DEBUG=$<BOOL:$<CONFIG:Debug>>
+            SLANG_RHI_NVAPI_INCLUDE_DIR="${SLANG_RHI_NVAPI_INCLUDE_DIR}"
+            SLANG_RHI_OPTIX_DEVICE_HEADER_INCLUDE_DIR="${SLANG_RHI_OPTIX_DEVICE_HEADER_INCLUDE_DIR}"
+            $<$<PLATFORM_ID:Windows>:NOMINMAX>
+            $<$<PLATFORM_ID:Windows>:WIN32_LEAN_AND_MEAN>
+            $<$<PLATFORM_ID:Windows>:UNICODE>
+        )
+        target_link_libraries(${name} PRIVATE slang-rhi slang slang-rhi-warnings)
+    endfunction()
+
+    set(example_sources
+        examples/surface/example-surface.cpp
+        examples/triangle/example-triangle.cpp
+        examples/shader-toy/example-shader-toy.cpp
+        examples/raster/example-raster.cpp
+        examples/particles/example-particles.cpp
+    )
+    # The path tracer requires acceleration structures, unavailable in WebGPU.
+    if(NOT EMSCRIPTEN)
+        list(APPEND example_sources examples/path-tracer/example-path-tracer.cpp)
+    endif()
+    foreach(source IN LISTS example_sources)
+        get_filename_component(name "${source}" NAME_WE)
+        add_example(${name} ${source})
+    endforeach()
+    add_example(example-runner examples/example-runner.cpp ${example_sources})
+    target_compile_definitions(example-runner PRIVATE EXAMPLE_COMBINED=1)
+
+    if(EMSCRIPTEN)
         add_executable(wasm-test examples/wasm/wasm-test.cpp)
         target_compile_features(wasm-test PRIVATE cxx_std_17)
         target_link_libraries(wasm-test PRIVATE slang-rhi slang)
@@ -1237,6 +1274,8 @@ if(SLANG_RHI_BUILD_EXAMPLES)
             "--use-port=emdawnwebgpu"
             "--shell-file" "${CMAKE_CURRENT_SOURCE_DIR}/examples/wasm/index.html"
         )
+        file(GENERATE OUTPUT "${SLANG_RHI_BINARY_DIR}/index.html"
+            INPUT "${CMAKE_CURRENT_SOURCE_DIR}/examples/wasm/gallery.html")
     endif()
 endif()
 

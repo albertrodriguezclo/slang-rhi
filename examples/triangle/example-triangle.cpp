@@ -1,5 +1,7 @@
 #include "../base/example.h"
 
+namespace {
+
 using namespace rhi;
 
 // Define vertex structure
@@ -96,7 +98,7 @@ public:
 
         // Acquire next image from the surface
         ComPtr<ITexture> image;
-        m_surface->acquireNextImage(image.writeRef());
+        acquireSurfaceImage(image.writeRef());
         if (!image)
         {
             return SLANG_OK;
@@ -187,4 +189,6 @@ public:
     float m_grey = 0.5f;
 };
 
-EXAMPLE_MAIN(ExampleTriangle)
+} // namespace
+
+EXAMPLE_MAIN(ExampleTriangle, "triangle", "Triangle")

@@ -1,5 +1,7 @@
 #include "../base/example.h"
 
+namespace {
+
 using namespace rhi;
 
 class ExampleSurface : public ExampleBase
@@ -44,7 +46,7 @@ public:
 
         // Acquire next image from the surface
         ComPtr<ITexture> image;
-        m_surface->acquireNextImage(image.writeRef());
+        acquireSurfaceImage(image.writeRef());
         if (!image)
         {
             return SLANG_OK;
@@ -107,4 +109,6 @@ public:
     float m_grey = 0.5f;
 };
 
-EXAMPLE_MAIN(ExampleSurface)
+} // namespace
+
+EXAMPLE_MAIN(ExampleSurface, "surface", "Surface")

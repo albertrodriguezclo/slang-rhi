@@ -199,6 +199,20 @@ Result DeviceImpl::initialize(const DeviceDesc& desc, BackendImpl* backend)
         api.wgpuAdapterGetInfo(m_ctx.adapter, &wgpuAdapterInfo);
         SLANG_RHI_DEFERRED({ api.wgpuAdapterInfoFreeMembers(wgpuAdapterInfo); });
         m_adapterName = std::string(wgpuAdapterInfo.device.data, wgpuAdapterInfo.device.length);
+        // Browsers may expose only the vendor and architecture instead of a device name.
+        if (m_adapterName.empty() && wgpuAdapterInfo.description.length)
+            m_adapterName.assign(wgpuAdapterInfo.description.data, wgpuAdapterInfo.description.length);
+        if (m_adapterName.empty())
+        {
+            if (wgpuAdapterInfo.vendor.length)
+                m_adapterName.assign(wgpuAdapterInfo.vendor.data, wgpuAdapterInfo.vendor.length);
+            if (wgpuAdapterInfo.architecture.length)
+            {
+                if (!m_adapterName.empty())
+                    m_adapterName += " / ";
+                m_adapterName.append(wgpuAdapterInfo.architecture.data, wgpuAdapterInfo.architecture.length);
+            }
+        }
         m_info.adapterName = m_adapterName.c_str();
         subgroupMinSize = wgpuAdapterInfo.subgroupMinSize;
         subgroupMaxSize = wgpuAdapterInfo.subgroupMaxSize;

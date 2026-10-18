@@ -717,7 +717,25 @@ WGPUStoreOp translateStoreOp(StoreOp op)
     return WGPUStoreOp_Undefined;
 }
 
-// Synchronously waits for a WebGPU future to complete, using native blocking on desktop and safe, adaptive event-loop
+#if SLANG_WASM
+// Yield a browser task so GPU completion callbacks can run, without the minimum delay of nested timers.
+// A microtask (Promise.resolve) would not give the browser a chance to deliver GPU events.
+// clang-format off
+EM_ASYNC_JS(void, waitForBrowserTask, (), {
+    await new Promise(resolve => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+            channel.port1.close();
+            channel.port2.close();
+            resolve();
+        };
+        channel.port2.postMessage(null);
+    });
+});
+// clang-format on
+#endif
+
+// Synchronously waits for a WebGPU future to complete, using native blocking on desktop and adaptive event-loop
 // polling in WebAssembly to prevent browser deadlocks.
 WGPUWaitStatus wait(const API& api, WGPUInstance instance, WGPUFuture future, uint64_t timeoutNS)
 {
@@ -726,10 +744,8 @@ WGPUWaitStatus wait(const API& api, WGPUInstance instance, WGPUFuture future, ui
 #if !SLANG_WASM
     return api.wgpuInstanceWaitAny(instance, SLANG_COUNT_OF(futures), futures, timeoutNS);
 #else
-    // With JSPI, an untimed wait suspends until the future's promise settles. Polling with
-    // emscripten_sleep goes through setTimeout, which browsers clamp to several milliseconds per wait
-    // even when the GPU work has already completed. Asyncify builds keep polling: suspending inside
-    // emdawnwebgpu's wait is not reliable with Asyncify and -fwasm-exceptions.
+    // With JSPI, an untimed wait suspends until the future's promise settles. Asyncify builds keep
+    // polling: suspending inside emdawnwebgpu's wait is not reliable with Asyncify and -fwasm-exceptions.
     if (timeoutNS == UINT64_MAX && emscripten_has_asyncify() == 2)
         return api.wgpuInstanceWaitAny(instance, SLANG_COUNT_OF(futures), futures, UINT64_MAX);
 
@@ -752,8 +768,11 @@ WGPUWaitStatus wait(const API& api, WGPUInstance instance, WGPUFuture future, ui
                 return WGPUWaitStatus_TimedOut;
         }
 
-        // adaptive yielding
-        emscripten_sleep((spinCount < 5) ? 0 : 1);
+        // Try a few task yields for short waits, then back off to avoid continuous polling on slow GPU work.
+        if (spinCount < 5)
+            waitForBrowserTask();
+        else
+            emscripten_sleep(1);
         spinCount++;
     }
 #endif
