@@ -96,6 +96,31 @@ On Windows, append `.exe` to executable names. Tests and examples need the
 corresponding build options enabled; windowed examples also need a display and
 a backend that supports rendering and presentation.
 
+Desktop builds produce individual binaries such as `example-triangle` and a
+combined `example-runner`. The combined runner starts with Surface by default:
+
+```sh
+./example-runner --list-examples
+./example-runner --example raster
+./example-runner --example triangle --device wgpu
+./example-runner --example particles --free-running
+```
+
+Press F5 in any backend window to open the example picker in all windows. Use
+Up/Down to move the shared selection and Enter to switch. Escape cancels; F5 also
+dismisses the picker in all windows. Browsing does not switch examples until
+confirmed. The picker works even when the normal overlay is hidden and consumes
+keyboard input while open.
+F4 still toggles the profiler, as in the individual binaries. A selection switches
+all backend windows together. The runner waits for the old examples to shut down,
+recreates their devices and windows, and resets input and timing before starting
+the new selection. Example settings are reset on each switch.
+Unsupported backends are skipped using the same feature checks as the individual
+binaries; they are tried again on the next selection. If a runtime selection is
+unsupported by every backend, the runner returns to the last working example.
+An unsupported initial selection exits with failure. Outside the picker, Escape
+exits the whole runner. Closing a window always exits, including during a switch.
+
 GPU test names end in the backend name. Use doctest's test-case filter to select
 tests, or select a backend explicitly:
 

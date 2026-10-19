@@ -1202,13 +1202,12 @@ endif()
 if(SLANG_RHI_BUILD_EXAMPLES)
     if(NOT EMSCRIPTEN)
         find_package(Threads REQUIRED)
-        function(add_example name source)
-            add_executable(${name} ${source})
+        function(add_example name)
+            add_executable(${name} ${ARGN})
             target_compile_features(${name} PRIVATE cxx_std_20)
-            get_filename_component(EXAMPLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/${source}" PATH)
             target_compile_definitions(${name}
                 PRIVATE
-                EXAMPLE_DIR="${EXAMPLE_DIR}"
+                EXAMPLE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/examples"
                 SLANG_RHI_DEBUG=$<BOOL:$<CONFIG:Debug>>
                 SLANG_RHI_NVAPI_INCLUDE_DIR="${SLANG_RHI_NVAPI_INCLUDE_DIR}"
                 SLANG_RHI_OPTIX_DEVICE_HEADER_INCLUDE_DIR="${SLANG_RHI_OPTIX_DEVICE_HEADER_INCLUDE_DIR}"
@@ -1219,12 +1218,20 @@ if(SLANG_RHI_BUILD_EXAMPLES)
             target_link_libraries(${name} PRIVATE slang-rhi slang glfw Threads::Threads slang-rhi-warnings)
         endfunction()
 
-        add_example(example-path-tracer examples/path-tracer/example-path-tracer.cpp)
-        add_example(example-particles examples/particles/example-particles.cpp)
-        add_example(example-raster examples/raster/example-raster.cpp)
-        add_example(example-shader-toy examples/shader-toy/example-shader-toy.cpp)
-        add_example(example-surface examples/surface/example-surface.cpp)
-        add_example(example-triangle examples/triangle/example-triangle.cpp)
+        set(example_sources
+            examples/surface/example-surface.cpp
+            examples/triangle/example-triangle.cpp
+            examples/shader-toy/example-shader-toy.cpp
+            examples/raster/example-raster.cpp
+            examples/particles/example-particles.cpp
+            examples/path-tracer/example-path-tracer.cpp
+        )
+        foreach(source IN LISTS example_sources)
+            get_filename_component(name "${source}" NAME_WE)
+            add_example(${name} ${source})
+        endforeach()
+        add_example(example-runner examples/example-runner.cpp ${example_sources})
+        target_compile_definitions(example-runner PRIVATE EXAMPLE_COMBINED=1)
     else()
         add_executable(wasm-test examples/wasm/wasm-test.cpp)
         target_compile_features(wasm-test PRIVATE cxx_std_17)
