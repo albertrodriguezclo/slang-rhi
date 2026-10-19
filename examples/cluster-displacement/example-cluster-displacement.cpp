@@ -26,7 +26,7 @@
 // The selection modes retain independent state, including while frozen.
 // Minus/equals adjusts quality (0.125x-8x); brackets adjust amplitude (0-3).
 // Keys 1-4 select shaded, cluster, level, or triangle-edge views; C cycles them.
-// R resets the camera; F1 toggles the overlay; F2 fits windows; Escape closes.
+// R resets the camera; F1 toggles the overlay; F2 fits windows; F3 toggles VSync; Escape closes.
 
 #include "../base/example.h"
 #include "../base/camera.h"
@@ -451,9 +451,9 @@ public:
             LOG_INFO("Cluster displacement currently supports D3D12, Vulkan, and CUDA.");
             return SLANG_E_NOT_AVAILABLE;
         }
-        SLANG_RETURN_ON_FAIL(createWindow(m_device, "Cluster displacement", 960, 640));
+        SLANG_RETURN_ON_FAIL(createWindow(m_device, "Cluster displacement"));
         SLANG_RETURN_ON_FAIL(createSurface(m_device, Format::Undefined, m_surface.writeRef()));
-        SLANG_RETURN_ON_FAIL(initOverlay(m_device, m_surface->getConfig()->format, 1.f));
+        SLANG_RETURN_ON_FAIL(initOverlay(m_device, m_surface->getConfig()->format));
         SLANG_RETURN_ON_FAIL(m_device->getQueue(QueueType::Graphics, m_queue.writeRef()));
         m_blitter = std::make_unique<Blitter>(m_device);
         SLANG_RETURN_ON_FAIL(m_scene.initialize(m_device, "cluster-displacement.slang"));
@@ -489,7 +489,6 @@ public:
 
     Result draw() override
     {
-        SLANG_RETURN_ON_FAIL(m_surfaceResult);
         if (!m_surface->getConfig())
             return SLANG_OK;
         // One resource set: retire the preceding frame before reusing geometry, scratch,
@@ -540,10 +539,11 @@ public:
         pass->end();
         SLANG_RETURN_ON_FAIL(m_blitter->blit(image, m_output, encoder));
         clearOverlay();
-        printOverlay("Left drag: Look | W/A/S/D: Move | Q/E: Down/up | Shift: Faster\n");
+        printOverlayHeader();
+        printCameraControls();
         printOverlay("Space: Pause | F: Freeze LOD | -/=: Quality | [/]: Amplitude\n");
         printOverlay("C: Cycle views | 1: Shaded | 2: Clusters | 3: Levels | 4: Edges\n");
-        printOverlay("T: Adaptive/uniform | R: Reset view | F1: Overlay | F2: Fit windows | Esc: Close\n\n");
+        printOverlay("T: Adaptive/uniform | R: Reset view\n\n");
         printOverlay(
             "%s | Amplitude: %.2f | Quality: %.3gx | LOD: %s\n",
             m_paused ? "Paused" : "Animated",
@@ -562,23 +562,21 @@ public:
         ComPtr<ICommandBuffer> commands;
         SLANG_RETURN_ON_FAIL(encoder->finish(commands.writeRef()));
         SLANG_RETURN_ON_FAIL(m_queue->submit(commands));
-        return m_surface->present();
+        return presentSurface();
     }
 
-    void onResize(int width, int height, int framebufferWidth, int framebufferHeight) override
+    Result onResize(int width, int height, int framebufferWidth, int framebufferHeight) override
     {
-        m_surfaceResult = m_queue->waitOnHost();
-        if (SLANG_FAILED(m_surfaceResult))
-            return;
+        SLANG_RETURN_ON_FAIL(m_queue->waitOnHost());
         if (framebufferWidth > 0 && framebufferHeight > 0)
         {
             SurfaceConfig config;
             config.width = framebufferWidth;
             config.height = framebufferHeight;
-            m_surfaceResult = m_surface->configure(config);
+            return configureSurface(m_surface, config);
         }
         else
-            m_surfaceResult = m_surface->unconfigure();
+            return m_surface->unconfigure();
     }
 
     void onMousePosition(float x, float y) override { m_controller.onMousePosition(x, y); }
@@ -643,8 +641,7 @@ public:
     Surface m_scene;
     Renderer m_renderer;
     Camera m_camera;
-    FlyCameraController m_controller;
-    Result m_surfaceResult = SLANG_OK;
+    CameraController m_controller;
     double m_previousTime = -1;
     float m_animationTime = 0;
     float m_amplitude = 1;
