@@ -1,6 +1,67 @@
 #include "../../include/slang-rhi-device.h"
 // CLUSTER_* bounds and LOD policy are supplied by example-cluster-displacement.cpp.
 
+// Integer hashing keeps the terrain fixed as the camera and subdivision change.
+float noiseValue(int2 cell)
+{
+    uint h = uint(cell.x) * 0x8da6b343u ^ uint(cell.y) * 0xd8163841u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return float(h >> 8) * (2.0 / 16777215.0) - 1;
+}
+
+float terrainNoise(float2 p)
+{
+    int2 cell = int2(floor(p));
+    float2 f = frac(p);
+    float2 u = f * f * f * (f * (f * 6 - 15) + 10);
+    return lerp(lerp(noiseValue(cell), noiseValue(cell + int2(1, 0)), u.x),
+                lerp(noiseValue(cell + int2(0, 1)), noiseValue(cell + int2(1, 1)), u.x), u.y);
+}
+
+float rockiness(float2 p)
+{
+    // A broad, gently rolling basin on one side and increasingly rocky hills on the other.
+    return smoothstep(-2.5, 2.5, p.x + 0.25 * p.y);
+}
+
+float terrainHeight(float2 p, float spacing, float time)
+{
+    float detail = 0;
+    float frequency = 0.25;
+    float2 domain = p;
+    float weight = 0.55;
+    for (uint octave = 0; octave < 7; ++octave)
+    {
+        // Fade bands before they reach the mesh Nyquist limit. This is an approximate
+        // footprint filter, not an integer octave cutoff or a texture-only normal effect.
+        float band = 1 - smoothstep(0.18, 0.45, frequency * spacing);
+        detail += weight * band * terrainNoise(domain * frequency + float2(13.7, 9.2));
+        // Rotate successive octaves so their lattice directions do not line up.
+        domain = float2(0.8 * domain.x - 0.6 * domain.y, 0.6 * domain.x + 0.8 * domain.y);
+        frequency *= 2;
+        weight *= 0.5;
+    }
+    float rough = rockiness(p);
+    float height = -0.25 + 0.75 * rough + 0.15 * sin(p.y * 0.35);
+    height += lerp(0.08, 1.0, rough) * detail;
+
+    // Only this localized bulge moves; fine terrain detail stays anchored in world space.
+    // Broaden and attenuate it on coarse meshes to avoid undersampling the deformation.
+    float2 center = float2(2.8 * cos(time * 0.24), 2.0 * sin(time * 0.31));
+    float radiusSquared = 1.2 * 1.2 + 2 * spacing * spacing;
+    float2 offset = p - center;
+    height += 0.35 * (1.2 * 1.2 / radiusSquared) * exp(-dot(offset, offset) / radiusSquared);
+    return height;
+}
+
+// Base <= 0.65, the seven octave weights sum to < 1.1, and the bulge <= 0.35.
+// The negative bound is smaller. Keep LOD selection conservative at every amplitude.
+static const float kTerrainHeightBound = 2.1;
+
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void selectLevel(
@@ -19,7 +80,7 @@ void selectLevel(
     }
     // Distance to the displaced surface's conservative bounding box. Looking away
     // never removes patches, so off-screen geometry remains available to shadow rays.
-    float3 extent = float3(CLUSTER_SURFACE_SIZE * 0.5, abs(amplitude), CLUSTER_SURFACE_SIZE * 0.5);
+    float3 extent = float3(CLUSTER_SURFACE_SIZE * 0.5, kTerrainHeightBound * abs(amplitude), CLUSTER_SURFACE_SIZE * 0.5);
     float distance = max(length(max(abs(cameraPosition) - extent, 0)), 0.25);
     float projectedSize = CLUSTER_SURFACE_SIZE * projectionScale / distance;
     float desiredSide = max(projectedSize * quality / (8 * CLUSTER_TARGET_EDGE_PIXELS), 1e-6);
@@ -68,7 +129,7 @@ void selectTree(uint3 tid : SV_DispatchThreadID,
     }
     float size = CLUSTER_SURFACE_SIZE / float(side);
     float2 center = (float2(p) + 0.5) * size - CLUSTER_SURFACE_SIZE * 0.5;
-    float3 extent = float3(size * 0.5, abs(amplitude), size * 0.5);
+    float3 extent = float3(size * 0.5, kTerrainHeightBound * abs(amplitude), size * 0.5);
     float distance = max(length(max(abs(cameraPosition - float3(center.x, 0, center.y)) - extent, 0)), 0.25);
     float demand = size * projectionScale * quality / (distance * 8 * CLUSTER_TARGET_EDGE_PIXELS);
     float threshold = lodState[2] == 0 ? 1 : (tree[index] != 0 ? 1 - CLUSTER_LOD_HYSTERESIS : 1 + CLUSTER_LOD_HYSTERESIS);
@@ -135,7 +196,48 @@ void finishSelection(uniform RWStructuredBuffer<uint> lodState, uniform Structur
     clusterArgs[0] = blas;
 }
 
-// All shared boundary positions use the same integer grid coordinates and expression.
+// Build a continuous filter field on the finest patch lattice (65 x 65 entries).
+// Each corner takes the coarsest of its incident leaves, including diagonal neighbors.
+// Interpolation stays at least as coarse as the containing leaf and spreads a coarse
+// neighbor's footprint into the fine side. Unlike filtering by the emitting patch's
+// level, this defines one height for every shared coordinate, even at multi-LOD corners.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void prepareDisplacement(uint3 tid : SV_DispatchThreadID,
+    uniform StructuredBuffer<uint> tree, uniform StructuredBuffer<uint> lodState,
+    uniform RWStructuredBuffer<float> filterLevels, uniform uint adaptive)
+{
+    const uint side = 1u << CLUSTER_MAX_LEVEL;
+    if (tid.x >= (side + 1) * (side + 1)) return;
+    uint level = lodState[0];
+    if (adaptive != 0)
+    {
+        int2 corner = int2(tid.x % (side + 1), tid.x / (side + 1));
+        level = CLUSTER_MAX_LEVEL;
+        for (int y = -1; y <= 0; ++y)
+            for (int x = -1; x <= 0; ++x)
+            {
+                uint2 cell = uint2(clamp(corner + int2(x, y), int2(0), int2(side - 1)));
+                level = min(level, leafLevel(tree, cell));
+            }
+    }
+    filterLevels[tid.x] = float(level);
+}
+
+float displacementSpacing(uint2 coord, StructuredBuffer<float> filterLevels)
+{
+    const uint side = 1u << CLUSTER_MAX_LEVEL;
+    uint2 cell = min(coord / 8, uint2(side - 1));
+    float2 f = float2(coord - cell * 8) / 8.0;
+    // Smooth interpolation avoids a derivative discontinuity at filter-grid lines.
+    f = f * f * (3 - 2 * f);
+    uint base = cell.y * (side + 1) + cell.x;
+    float level = lerp(lerp(filterLevels[base], filterLevels[base + 1], f.x),
+                       lerp(filterLevels[base + side + 1], filterLevels[base + side + 2], f.x), f.y);
+    return (CLUSTER_SURFACE_SIZE / 8.0) * exp2(-level);
+}
+
+// Shared positions and filter footprints depend only on canonical integer coordinates.
 [shader("compute")]
 [numthreads(128, 1, 1)]
 void generateSurface(
@@ -145,6 +247,7 @@ void generateSurface(
     uniform RWStructuredBuffer<rhi::TriangleClusterArgs> triangleArgs,
     uniform StructuredBuffer<uint> counts,
     uniform StructuredBuffer<uint> lodState,
+    uniform StructuredBuffer<float> filterLevels,
     uniform uint64_t vertexAddress, uniform uint64_t indexAddress,
     uniform float time, uniform float amplitude, uniform uint adaptive)
 {
@@ -158,8 +261,7 @@ void generateSurface(
     {
         uint2 coord = (patch * 8 + uint2(lane % 9, lane / 9)) << (CLUSTER_MAX_LEVEL - level);
         float2 p = float2(coord) * (CLUSTER_SURFACE_SIZE / float((1u << CLUSTER_MAX_LEVEL) * 8)) - CLUSTER_SURFACE_SIZE * 0.5;
-        float height = amplitude * (0.65 * sin(p.x * 1.4 + time) * cos(p.y * 0.9 - time * 0.7)
-                                  + 0.35 * sin(p.x * 2.3 + p.y * 1.7 + time * 1.3));
+        float height = amplitude * terrainHeight(p, displacementSpacing(coord, filterLevels), time);
         vertices[id * 81 + lane] = float3(p.x, height, p.y);
     }
     if (lane != 0) return;
@@ -262,7 +364,9 @@ void renderRaygen(uniform float3 cameraPosition, uniform float3 imageU, uniform 
         RayDesc shadowRay = {position + normal * 0.002, 0.001, light, 1000};
         Payload shadow = {};
         TraceRay(tlas, RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xff, 0, 0, 0, shadowRay, shadow);
-        float3 albedo = float3(0.18, 0.52, 0.36);
+        float3 albedo = lerp(float3(0.16, 0.29, 0.09), float3(0.46, 0.34, 0.21), rockiness(position.xz));
+        float slope = 1 - abs(normal.y);
+        albedo = lerp(albedo, float3(0.43, 0.45, 0.46), smoothstep(0.12, 0.55, slope));
         if (viewMode == 1)
         {
             uint3 patch = surfacePatches[hit.cluster].xyz;
@@ -283,5 +387,6 @@ void renderRaygen(uniform float3 cameraPosition, uniform float3 imageU, uniform 
             color = lerp(float3(0.015), color, interior);
         }
     }
-    output[pixel] = float4(pow(max(color, 0), 1.0 / 2.2), 1);
+    // The shared blitter handles the surface format's sRGB encoding.
+    output[pixel] = float4(max(color, 0), 1);
 }
