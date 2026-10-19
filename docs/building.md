@@ -95,6 +95,22 @@ and `lib/` directories. Use a Slang version compatible with this checkout.
 See [CMakeLists.txt](../CMakeLists.txt) for the full set of options and the
 selected dependency versions.
 
+The Windows D3D12 build uses DXC 1.10.2605.24 and Agility SDK
+1.721.3-preview for Shader Model 6.10 Linear Algebra (cooperative vectors).
+Executables select the bundled runtime by including `slang-rhi/agility-sdk.h`
+and placing `SLANG_RHI_EXPORT_AGILITY_SDK` at file scope. Applications using the
+preview shader model must also enable
+`D3D12ExperimentalShaderModels` before device creation, using
+`D3D12ExperimentalFeaturesDesc`. The neural marble example does this explicitly;
+other examples do not enable experimental shader models automatically. Deploy
+the `hlsl/` directory alongside DXC and the executable/library: Slang's generated
+LinAlg shaders include DXC's `dx/linalg.h` at runtime. CMake copies and installs
+these headers with the compiler.
+
+To override the dependencies with a retail Agility SDK, also set
+`SLANG_RHI_AGILITY_SDK_VERSION=D3D12_SDK_VERSION`. A retail configuration does not
+enable the SM 6.10 cooperative-vector path.
+
 ## Run tests and examples
 
 Run from the build output directory:
@@ -123,3 +139,81 @@ unsupported devices or features may otherwise be skipped.
 
 The [CI workflow](../.github/workflows/ci.yml) records the compiler, platform,
 and backend combinations exercised by the project.
+
+### Neural marble example
+
+Build `example-neural-marble` and run it with `--device vulkan` to watch a small
+network learn a procedural navy-and-gold marble texture from random weights:
+
+```sh
+cmake --build build --config Debug --target example-neural-marble
+./build/Debug/example-neural-marble --device vulkan
+```
+
+The three panels show the procedural reference, learned RGB texture, and RGB
+root-mean-square error with a fixed 0–0.25 color scale. Training starts immediately.
+The overlay reports delayed validation MSE on a fixed grid, optimizer steps,
+and separate GPU timings for matrix preparation, training, and inference.
+
+| Key | Action |
+|-----|--------|
+| Space | Pause/resume training. |
+| R | Reset grid features, MLP weights, Adam moments, and step count; preserve the current target and pause state. |
+| G | Change the marble seed, vein frequency, and turbulence; preserve the grid, MLP, and optimizer. |
+| C | Switch cooperative-vector/ordinary-math execution when available, preserving training state. |
+
+The shared F1–F4 and Escape shortcuts control the overlay, window layout, VSync,
+profiler, and exit. There are no mouse controls or external texture/model assets.
+
+The UV encoding is a trainable multiresolution 2D hash grid inspired by
+[instant-NGP](https://nvlabs.github.io/instant-ngp/). Eight levels span 8 to 256
+cells per axis, with two features per grid vertex. Coarse levels use dense
+storage; finer levels hash vertices into 4,096 entries each. Bilinear sampling
+produces 16 inputs for two 64-wide hidden layers and four outputs (RGB plus
+padding). The MLP has 5,508 parameters; the grid adds 35,742 trainable features.
+
+Slang autodiff differentiates the bilinear interpolation, network, and RGB loss.
+Custom derivatives connect grid loads and linear layers to shared parameter
+storage. Each sample writes four gradient nodes per grid level; integer atomic
+exchanges link nodes sharing an entry, including hash collisions. An optimizer
+pass sums each entry's list and applies Adam. This avoids float atomics and a
+dense per-sample grid-gradient buffer. The MLP uses per-sample gradients reduced
+in a separate pass. Both optimizers decay moments even for zero gradients. The
+cooperative-vector path uses FP16 matrix-vector operations in the forward and
+backward passes, while master weights, gradients, and optimizer state stay FP32.
+RHI matrix-size queries and GPU layout conversion prepare inference-optimal
+matrices after updates. Training samples the entire UV domain independently of
+the fixed-resolution preview. Validation uses a 128-by-128 grid to capture fine
+vein errors. Adjust grid levels, resolutions, table capacity, network width,
+learning rates, batch size, and steps per frame in
+[settings.h](../examples/neural-marble/settings.h). Wider networks also increase
+per-sample gradient storage and training cost; compare convergence at equal
+elapsed training time when tuning these settings.
+
+Cooperative execution is enabled on Vulkan and D3D12 devices advertising the
+required FP16 configuration. Run `example-neural-marble --device d3d12` for the
+DirectX path, which requires SM 6.10 support (NVIDIA R615 or newer). D3D12 checks
+native Linear Algebra operation support and retains NVAPI matrix conversion.
+The overlay reports `Cooperative vectors` when that path is active; unsupported
+devices use ordinary math. CUDA, Metal, and WebGPU also use ordinary math;
+Slang's native CUDA buffer overload does not emit the correct matrix address.
+Direct3D requires Shader Model 6/DXC; the example skips D3D11 because FXC cannot
+efficiently compile the differentiated arrays.
+
+The headless regressions check grid gradients against finite differences at
+domain boundaries and with forced hash collisions, learning across multiple
+marble seeds, adaptation, cooperative-mode parity where supported, and reset
+of both parameter sets and optimizers. Shared-entry sums can differ slightly
+with GPU scheduling, so grid update comparisons allow floating-point roundoff:
+
+```sh
+./build/Debug/slang-rhi-tests -tc="neural-marble-*"
+```
+
+To exercise SM 6.10 explicitly, including the cooperative-vector conversion
+tests, use `-select-devices=d3d12 -require-devices=d3d12
+-d3d12-shader-model=6.10`. The test harness enables experimental shader models
+for this selection before creating any devices. Its default D3D12 suite remains
+capped at SM 6.8; run the SM 6.10 configuration separately to check marble's
+cooperative execution path. Enabling experimental features after devices have
+already been created can invalidate those devices.
