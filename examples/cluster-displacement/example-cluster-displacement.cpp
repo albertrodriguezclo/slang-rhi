@@ -45,7 +45,10 @@
 // X approaches the surface at the center of the view by 5x (and slows movement).
 // Z moves to a detail view; R returns to the overview. Scroll changes movement
 // speed for close exploration (0.0001-30 units/second); Shift temporarily speeds up.
-// F1 toggles the overlay; F2 fits windows; F3 toggles VSync; Escape closes.
+// F1 toggles the overlay; F2 fits windows; F3 toggles VSync; F4 toggles profiling.
+// GPU timings separate LOD evaluation/balancing/allocation, geometry generation,
+// CLAS/BLAS/TLAS builds, and ray tracing. Repeated LOD rounds are summed; timing
+// excludes presentation and CPU recording. Escape closes.
 
 #include "../base/example.h"
 #include "../base/camera.h"
@@ -326,6 +329,8 @@ struct Surface
     {
         if (lod.projectionScale <= 0 || lod.quality <= 0)
             return SLANG_E_INVALID_ARG;
+        Profiler::pushRegion(encoder, "Surface rebuild");
+        Profiler::pushRegion(encoder, "LOD selection");
         auto pass = encoder->beginComputePass();
         ShaderCursor cursor(pass->bindPipeline(selectPipeline)->getEntryPoint(0));
         SLANG_RETURN_ON_FAIL(cursor["adaptive"].setData(lod.adaptive ? 1u : 0u));
@@ -349,6 +354,7 @@ struct Surface
             for (uint32_t round = 0; round < 2 && !lod.frozen; ++round)
                 for (uint32_t splitting = 0; splitting < 2; ++splitting)
                 {
+                    Profiler::pushRegion(encoder, splitting ? "Evaluate splits" : "Evaluate merges");
                     pass = encoder->beginComputePass();
                     cursor = ShaderCursor(pass->bindPipeline(treePipeline)->getEntryPoint(0));
                     SLANG_RETURN_ON_FAIL(cursor["tree"].setBinding(tree));
@@ -369,7 +375,10 @@ struct Surface
                     pass->dispatchCompute(kNodeCount, 1, 1);
                     pass->end();
                     encoder->globalBarrier();
+                    Profiler::popRegion(encoder);
                     if (splitting)
+                    {
+                        Profiler::pushRegion(encoder, "Balance tree");
                         for (uint32_t level = kMaxLevel - 1; level > 0; --level)
                         {
                             pass = encoder->beginComputePass();
@@ -381,6 +390,9 @@ struct Surface
                             pass->end();
                             encoder->globalBarrier();
                         }
+                        Profiler::popRegion(encoder);
+                    }
+                    Profiler::pushRegion(encoder, "Allocate / recycle");
                     pass = encoder->beginComputePass();
                     cursor = ShaderCursor(pass->bindPipeline(allocatePipeline)->getEntryPoint(0));
                     SLANG_RETURN_ON_FAIL(cursor["tree"].setBinding(tree));
@@ -391,7 +403,9 @@ struct Surface
                     pass->dispatchCompute(1, 1, 1);
                     pass->end();
                     encoder->globalBarrier();
+                    Profiler::popRegion(encoder);
                 }
+            Profiler::pushRegion(encoder, "Compact leaves");
             pass = encoder->beginComputePass();
             cursor = ShaderCursor(pass->bindPipeline(compactPipeline)->getEntryPoint(0));
             SLANG_RETURN_ON_FAIL(cursor["tree"].setBinding(tree));
@@ -408,8 +422,11 @@ struct Surface
             pass->dispatchCompute(1, 1, 1);
             pass->end();
             encoder->globalBarrier();
+            Profiler::popRegion(encoder);
         }
+        Profiler::popRegion(encoder); // LOD selection
 
+        Profiler::pushRegion(encoder, "Generate geometry");
         pass = encoder->beginComputePass();
         cursor = ShaderCursor(pass->bindPipeline(generatePipeline)->getEntryPoint(0));
         SLANG_RETURN_ON_FAIL(cursor["adaptive"].setData(lod.adaptive ? 1u : 0u));
@@ -430,13 +447,20 @@ struct Surface
         encoder->globalBarrier();
         encoder->setBufferState(vertices, ResourceState::AccelerationStructureBuildInput);
         encoder->setBufferState(indices, ResourceState::AccelerationStructureBuildInput);
+        Profiler::popRegion(encoder); // Generate geometry
+        Profiler::pushRegion(encoder, "Build CLAS");
         encoder->executeClusterOperation(clasBuild);
         encoder->globalBarrier();
         encoder->setBufferState(clasData, ResourceState::AccelerationStructureRead);
         encoder->setBufferState(clasHandles, ResourceState::ShaderResource);
+        Profiler::popRegion(encoder);
+        Profiler::pushRegion(encoder, "Build BLAS");
         encoder->executeClusterOperation(blasBuild);
         encoder->globalBarrier();
         encoder->setBufferState(blasData, ResourceState::AccelerationStructureRead);
+        Profiler::popRegion(encoder);
+
+        Profiler::pushRegion(encoder, "Build TLAS");
 
         pass = encoder->beginComputePass();
         cursor = ShaderCursor(pass->bindPipeline(instancePipeline)->getEntryPoint(0));
@@ -451,6 +475,8 @@ struct Surface
         build.inputCount = 1;
         encoder->buildAccelerationStructure(build, tlas, nullptr, tlasScratch, 0, nullptr);
         encoder->globalBarrier();
+        Profiler::popRegion(encoder); // Build TLAS
+        Profiler::popRegion(encoder); // Surface rebuild
         return SLANG_OK;
     }
 };
@@ -524,6 +550,7 @@ public:
         SLANG_RETURN_ON_FAIL(createWindow(m_device, "Cluster displacement"));
         SLANG_RETURN_ON_FAIL(createSurface(m_device, Format::Undefined, m_surface.writeRef()));
         SLANG_RETURN_ON_FAIL(initOverlay(m_device, m_surface->getConfig()->format));
+        SLANG_RETURN_ON_FAIL(initProfiler(m_device));
         SLANG_RETURN_ON_FAIL(m_device->getQueue(QueueType::Graphics, m_queue.writeRef()));
         m_blitter = std::make_unique<Blitter>(m_device);
         SLANG_RETURN_ON_FAIL(m_scene.initialize(m_device, "cluster-displacement.slang"));
@@ -611,10 +638,13 @@ public:
         lod.quality = kTargetEdgePixels / m_targetEdgePixels;
         lod.frozen = m_freezeLod;
         lod.adaptive = m_adaptive;
+        auto profile = getProfiler().frame();
+        SLANG_RETURN_ON_FAIL(profile.begin());
         SLANG_RETURN_ON_FAIL(m_scene.rebuild(m_queue, m_animationTime, m_amplitude, lod));
         ComPtr<ICommandEncoder> encoder;
         SLANG_RETURN_ON_FAIL(m_queue->createCommandEncoder(encoder.writeRef()));
         auto pass = encoder->beginRayTracingPass();
+        Profiler::pushRegion(pass, "Ray tracing");
         auto root = pass->bindPipeline(m_renderer.pipeline, m_renderer.table);
         ShaderCursor globals(root);
         SLANG_RETURN_ON_FAIL(globals["tlas"].setBinding(m_scene.tlas));
@@ -630,6 +660,7 @@ public:
         SLANG_RETURN_ON_FAIL(cursor["imageW"].setData(m_camera.imageW));
         SLANG_RETURN_ON_FAIL(cursor["viewMode"].setData(m_viewMode));
         pass->dispatchRays(0, size.width, size.height, 1);
+        Profiler::popRegion(pass);
         pass->end();
         encoder->copyBuffer(m_lodStatistics, 0, m_scene.counts, 0, 3 * sizeof(uint32_t));
         encoder->copyBuffer(m_lodStatistics, 3 * sizeof(uint32_t), m_scene.allocator, sizeof(uint32_t), sizeof(float));
@@ -679,6 +710,7 @@ public:
         ComPtr<ICommandBuffer> commands;
         SLANG_RETURN_ON_FAIL(encoder->finish(commands.writeRef()));
         SLANG_RETURN_ON_FAIL(m_queue->submit(commands));
+        SLANG_RETURN_ON_FAIL(profile.end());
         m_haveLodStatistics = true;
         m_previousTargetEdge = m_targetEdgePixels;
         m_previousAdaptive = m_adaptive;
